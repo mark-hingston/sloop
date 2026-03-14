@@ -1,19 +1,21 @@
-# Copilot self-learning template (markdown-first)
+# Copilot markdown-first self-learning hook pack
 
-This branch shows a simpler self-learning pattern for GitHub Copilot: keep durable project guidance directly in `AGENTS.md` and update it over time as the repository evolves.
+This branch keeps the hook-based integration model from `main`, but swaps the learning backend from Mulch to plain markdown and `AGENTS.md`.
 
-There is no Mulch dependency on this branch. The feedback loop lives in plain markdown that stays versioned with the repo.
-
-This branch intentionally does not include hook scripts or an automated eval pipeline. The self-learning loop is the reviewable act of updating `AGENTS.md` with durable guidance.
+There is no Mulch dependency on this branch. Durable project memory lives in `AGENTS.md`, while the hook pack records tactical session summaries and local eval output under `.github/hooks/.runtime/`.
 
 ## What it does
 
-- gives Copilot a stable repo-local instruction file
-- keeps conventions and durable learnings in one visible place
-- lets humans or agents refine the shared memory by editing `AGENTS.md`
+- primes hook-generated context from `AGENTS.md` and recent runtime summaries at `sessionStart`
+- captures prompt and tool breadcrumbs during the session
+- writes markdown-backed tactical session records and eval summaries at `sessionEnd`
+- keeps durable learnings in `AGENTS.md`
 
 ## Template files
 
+- `.github/hooks/markdown-copilot.json` - Copilot hook configuration
+- `.github/hooks/markdown-self-learning.mjs` - hook runner for markdown-backed session capture
+- `.github/hooks/markdown-eval.mjs` - evaluator for local runtime session records
 - `AGENTS.md` - the repo-local instruction and memory file Copilot should read and maintain
 - `README.md` - explains how to use the markdown-first approach
 
@@ -21,23 +23,54 @@ This branch intentionally does not include hook scripts or an automated eval pip
 
 Before copying these files into a target repository, the user needs to:
 
-1. Commit `AGENTS.md` to the repository so Copilot can read it as repo-local guidance.
-2. Seed `AGENTS.md` with the project's key conventions, workflows, and constraints.
-3. Decide who is allowed to update it: humans only, agents only, or both through review.
+1. Ensure Node is available because the hook runner is executed with `node`.
+2. Commit `.github/hooks/markdown-copilot.json` so Copilot loads the hook configuration.
+3. Commit `AGENTS.md` so Copilot can read the repo-local durable guidance.
+4. Seed `AGENTS.md` with the project's key conventions, workflows, and constraints.
+5. Decide who is allowed to update it: humans only, agents only, or both through review.
 
-After that, copy `README.md` and `AGENTS.md` into the target repository and adapt the sections to your project.
+After that, copy `.github/hooks/`, `README.md`, and `AGENTS.md` into the target repository and adapt the sections to your project.
+
+## Notes
+
+- `.github/hooks/.runtime/` is local runtime state and is ignored by git.
+- `AGENTS.md` is the durable memory source of truth.
+- `prime.txt`, `last-session.md`, record JSON files, and `latest-eval.md` are generated locally by the hook scripts.
 
 ## How the loop works
 
-1. Start with a concise `AGENTS.md` that explains the project and the rules Copilot should follow.
-2. During work, treat `AGENTS.md` as the current durable memory for the repository.
-3. When you discover a reusable fact, add it back to `AGENTS.md` in a stable, general form.
-4. Periodically prune stale notes so the file stays short and high-signal.
-5. Review `AGENTS.md` changes like any other source change before merging them.
+1. `sessionStart` snapshots `AGENTS.md` and recent runtime summaries into `.github/hooks/.runtime/prime.txt`.
+2. `userPromptSubmitted`, `postToolUse`, and `errorOccurred` capture prompt and tool breadcrumbs into the current session log.
+3. `sessionEnd` writes a markdown-backed session record into `.github/hooks/.runtime/records/` and refreshes `.github/hooks/.runtime/last-session.md`.
+4. `sessionEnd` also background-spawns `markdown-eval.mjs --record-outcomes` to score recent records and refresh `.github/hooks/.runtime/latest-eval.md`.
+5. Humans or agents promote durable lessons by updating `AGENTS.md` itself.
 
 That gives you a practical cycle of:
 
-`repo guidance in AGENTS.md -> Copilot reads it -> work happens -> durable learnings get written back to AGENTS.md`
+`AGENTS.md -> prime.txt -> Copilot reads via AGENTS.md -> work happens -> hooks capture/evaluate -> durable learnings get written back to AGENTS.md`
+
+## Eval loop
+
+By default, the hook pack launches the evaluator in the background at `sessionEnd`. You can also run it manually:
+
+```bash
+node .github/hooks/markdown-eval.mjs
+node .github/hooks/markdown-eval.mjs --json
+node .github/hooks/markdown-eval.mjs --record-outcomes
+```
+
+The evaluator uses a deterministic rubric:
+
+- groundedness: changed files and evidence
+- reusability: whether the session updated durable `AGENTS.md` guidance
+- specificity: prompt/context richness
+- validation signal: tool execution and session outcome data
+
+Recommendations:
+
+- `promote` - strong candidate to keep reflected in `AGENTS.md`
+- `review` - useful, but still tactical or incomplete
+- `discard` - low-signal session summary
 
 ## What belongs in `AGENTS.md`
 
@@ -62,4 +95,4 @@ Avoid putting these in `AGENTS.md`:
 - record facts, not speculation
 - update or delete outdated guidance instead of endlessly appending
 
-If you later need something more automated, you can still layer hooks or external tooling on top. This branch is intentionally the lightweight baseline: just `README.md`, `AGENTS.md`, and normal git review.
+If you later need something more automated, you can still layer external tooling on top. This branch keeps the same hook-driven shape as `main`, but makes markdown and `AGENTS.md` the storage layer.
