@@ -1,6 +1,6 @@
-# Copilot + Mulch self-learning hook pack
+# Copilot + [Mulch](https://github.com/jayminwest/mulch) self-learning hook pack
 
-This folder is a minimal hook pack you can copy into an existing repository to add a Mulch-backed GitHub Copilot self-learning loop without modifying Mulch itself.
+This folder is a minimal hook pack you can copy into an existing repository to add a [Mulch](https://github.com/jayminwest/mulch)-backed GitHub Copilot self-learning loop without modifying Mulch itself.
 
 ## What it does
 
@@ -19,7 +19,7 @@ This folder is a minimal hook pack you can copy into an existing repository to a
 
 Before copying these files into a target repository, the user needs to:
 
-1. Install Mulch in the target repo, for example with `npm install -D @os-eco/mulch-cli`.
+1. Install [Mulch](https://github.com/jayminwest/mulch) in the target repo, for example with `npm install -D @os-eco/mulch-cli`.
 2. Initialize Mulch with `./node_modules/.bin/ml init`.
 3. Add a dedicated tactical inbox domain with `./node_modules/.bin/ml add copilot`.
 4. Add any real project domains you want to learn into, such as `api`, `frontend`, or `testing`.
