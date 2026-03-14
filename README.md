@@ -1,87 +1,62 @@
-# Copilot + [Mulch](https://github.com/jayminwest/mulch) self-learning hook pack
+# Copilot self-learning template (markdown-first)
 
-This folder is a minimal hook pack you can copy into an existing repository to add a [Mulch](https://github.com/jayminwest/mulch)-backed GitHub Copilot self-learning loop without modifying Mulch itself.
+This branch shows a simpler self-learning pattern for GitHub Copilot: keep durable project guidance directly in `AGENTS.md` and update it over time as the repository evolves.
+
+There is no Mulch dependency on this branch. The feedback loop lives in plain markdown that stays versioned with the repo.
 
 ## What it does
 
-- primes Mulch context at `sessionStart`
-- captures prompt and tool breadcrumbs during the session
-- records a tactical session summary into the `copilot` Mulch domain at `sessionEnd`
+- gives Copilot a stable repo-local instruction file
+- keeps conventions and durable learnings in one visible place
+- lets humans or agents refine the shared memory by editing `AGENTS.md`
 
 ## Files
 
-- `.github/hooks/mulch-copilot.json` - Copilot hook configuration
-- `.github/hooks/mulch-self-learning.mjs` - hook runner
-- `.github/hooks/mulch-eval.mjs` - asynchronous evaluator for `copilot` inbox records
-- `AGENTS.md` - tells Copilot to read the repo-local Mulch prime file
+- `AGENTS.md` - the repo-local instruction and memory file Copilot should read and maintain
+- `README.md` - explains how to use the markdown-first approach
 
 ## Bootstrap requirements
 
 Before copying these files into a target repository, the user needs to:
 
-1. Install [Mulch](https://github.com/jayminwest/mulch) in the target repo, for example with `npm install -D @os-eco/mulch-cli`.
-2. Initialize Mulch with `./node_modules/.bin/ml init`.
-3. Add a dedicated tactical inbox domain with `./node_modules/.bin/ml add copilot`.
-4. Add any real project domains you want to learn into, such as `api`, `frontend`, or `testing`.
-5. Ensure Node is available because the hook runner is executed with `node`.
-6. Commit `.github/hooks/mulch-copilot.json` to the default branch so Copilot loads it.
+1. Commit `AGENTS.md` to the repository so Copilot can read it as repo-local guidance.
+2. Seed `AGENTS.md` with the project's key conventions, workflows, and constraints.
+3. Decide who is allowed to update it: humans only, agents only, or both through review.
 
-After bootstrap, copy the three files in `.github/hooks/` plus `AGENTS.md` into the target repository.
-
-## Notes
-
-- The hook runner looks for Mulch at `./node_modules/.bin/ml` first, then falls back to `ml` or `mulch` on `PATH`.
-- The `copilot` domain is used as an inbox for hook-generated session summaries.
-- `sessionStart` exports primed context to `.github/hooks/.runtime/prime.txt`.
-- To promote durable learnings, review `ml query copilot` and re-record stable insights into your real domains.
-- `mulch-eval.mjs` is launched automatically in the background from `sessionEnd`, so it stays out of the synchronous hook path.
+After that, copy `README.md` and `AGENTS.md` into the target repository and adapt the sections to your project.
 
 ## How the loop works
 
-1. `sessionStart` runs `ml prime --exclude-domain copilot --format plain --export .github/hooks/.runtime/prime.txt`
-2. `userPromptSubmitted` logs the prompt to temp runtime state
-3. `postToolUse` and `errorOccurred` log tool results and failures
-4. `sessionEnd` runs `ml learn --json` and writes a session summary with `ml record copilot --stdin`
-5. `sessionEnd` also background-spawns `mulch-eval.mjs --record-outcomes`
-6. `mulch-eval.mjs` scores `copilot` records and appends `mulch-eval` outcomes asynchronously
-
-## Eval loop
-
-By default, the hook pack launches the evaluator in the background at `sessionEnd`. You can also run it manually or from CI:
-
-```bash
-node .github/hooks/mulch-eval.mjs
-node .github/hooks/mulch-eval.mjs --json
-node .github/hooks/mulch-eval.mjs --record-outcomes
-```
-
-The evaluator uses a deterministic rubric:
-
-- groundedness: changed files and evidence
-- reusability: domain mapping and breadth of touched files
-- specificity: prompt/context richness
-- validation signal: tool execution and existing session outcome data
-
-Recommendations:
-
-- `promote` - strong candidate to mine into real Mulch domains
-- `review` - useful, but still tactical or incomplete
-- `discard` - low-signal session summary
-
-When `--record-outcomes` is used, the script appends a `mulch-eval` outcome to each unevaluated record using stock `ml outcome`.
-
-The `copilot` domain acts as a tactical inbox for session summaries. It is excluded from priming so operational breadcrumbs do not get fed back into model context.
-
-## Closing the loop
-
-Hooks can prepare context, but they cannot directly inject it into Copilot's live prompt.
-
-This pack closes the loop by combining:
-
-- `sessionStart` hook: exports current Mulch context to `.github/hooks/.runtime/prime.txt`
-- `AGENTS.md`: instructs Copilot to read that file at the beginning of a session and refresh it for file-scoped work
-- `sessionEnd` hook: records new tactical learnings and launches async evaluation
+1. Start with a concise `AGENTS.md` that explains the project and the rules Copilot should follow.
+2. During work, treat `AGENTS.md` as the current durable memory for the repository.
+3. When you discover a reusable fact, add it back to `AGENTS.md` in a stable, general form.
+4. Periodically prune stale notes so the file stays short and high-signal.
 
 That gives you a practical cycle of:
 
-`Mulch domains -> prime.txt -> Copilot reads via AGENTS.md -> work happens -> hooks capture/evaluate -> humans/agents promote durable learnings back into Mulch`
+`repo guidance in AGENTS.md -> Copilot reads it -> work happens -> durable learnings get written back to AGENTS.md`
+
+## What belongs in `AGENTS.md`
+
+Good candidates:
+
+- coding conventions that apply across the repo
+- build, test, and release habits that are easy to forget
+- architectural guardrails
+- file- or subsystem-specific notes that will likely matter again
+
+Avoid putting these in `AGENTS.md`:
+
+- temporary debugging notes
+- one-off task plans
+- stale migrations or rollout checklists
+- long transcripts of what happened in a single session
+
+## Suggested maintenance pattern
+
+- keep sections short and scannable
+- prefer bullets over prose
+- record facts, not speculation
+- update or delete outdated guidance instead of endlessly appending
+
+If you later need something more automated, you can still layer hooks or external tooling on top. This branch is intentionally the lightweight baseline.
