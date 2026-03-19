@@ -48,9 +48,9 @@ sequenceDiagram
 
     Note over A,C: Session start
     C->>H: sessionStart (sync)
-    H->>A: read AGENTS.md + last-session.md + latest-eval.md
-    H->>P: write prime.txt (snapshot)
-    H-->>C: done — agent reads prime.txt via AGENTS.md
+    H->>A: read last-session.md + latest-eval.md
+    H->>P: write prime.txt (eval + session history only)
+    H-->>C: done — agent reads AGENTS.md directly, prime.txt for session context
 
     Note over A,C: During session
     C->>H: userPromptSubmitted (sync)
@@ -76,7 +76,7 @@ sequenceDiagram
     C->>A: update AGENTS.md with durable learnings
 ```
 
-1. `sessionStart` snapshots `AGENTS.md` and recent runtime summaries into `.github/hooks/.runtime/prime.txt`.
+1. `sessionStart` writes `.github/hooks/.runtime/prime.txt` containing only the latest eval summary and last session handoff — **not** `AGENTS.md` content, which Copilot already reads directly.
 2. `userPromptSubmitted` captures prompt breadcrumbs into the current session log. The agent waits for this hook so the log is current before the next tool call.
 3. `postToolUse` and `errorOccurred` append tool and error breadcrumbs **fire-and-forget**: stdin is captured into a shell variable, then piped to a backgrounded, disowned node process so the hook returns immediately. The agent does not wait.
 4. `sessionEnd` writes a markdown-backed session record into `.github/hooks/.runtime/records/` and refreshes `.github/hooks/.runtime/last-session.md`. The agent waits for this hook so records land before the session is torn down.
@@ -85,7 +85,7 @@ sequenceDiagram
 
 That gives you a practical cycle of:
 
-`AGENTS.md -> prime.txt -> Copilot reads via AGENTS.md -> work happens -> hooks capture/evaluate -> durable learnings get written back to AGENTS.md`
+`AGENTS.md (durable) + prime.txt (session history) -> Copilot works -> hooks capture/evaluate -> durable learnings get written back to AGENTS.md`
 
 ## Hook design
 
