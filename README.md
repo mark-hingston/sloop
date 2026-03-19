@@ -40,14 +40,43 @@ After that, copy `.github/hooks/`, `README.md`, and `AGENTS.md` into the target 
 ## How the loop works
 
 1. `sessionStart` snapshots `AGENTS.md` and recent runtime summaries into `.github/hooks/.runtime/prime.txt`.
-2. `userPromptSubmitted`, `postToolUse`, and `errorOccurred` capture prompt and tool breadcrumbs into the current session log.
-3. `sessionEnd` writes a markdown-backed session record into `.github/hooks/.runtime/records/` and refreshes `.github/hooks/.runtime/last-session.md`.
-4. `sessionEnd` also background-spawns `markdown-eval.mjs --record-outcomes` to score recent records and refresh `.github/hooks/.runtime/latest-eval.md`.
-5. Humans or agents promote durable lessons by updating `AGENTS.md` itself.
+2. `userPromptSubmitted` captures prompt breadcrumbs into the current session log. The agent waits for this hook so the log is current before the next tool call.
+3. `postToolUse` and `errorOccurred` append tool and error breadcrumbs **fire-and-forget**: stdin is captured into a shell variable, then piped to a backgrounded, disowned node process so the hook returns immediately. The agent does not wait.
+4. `sessionEnd` writes a markdown-backed session record into `.github/hooks/.runtime/records/` and refreshes `.github/hooks/.runtime/last-session.md`. The agent waits for this hook so records land before the session is torn down.
+5. `sessionEnd` also background-spawns `markdown-eval.mjs --record-outcomes` to score recent records and refresh `.github/hooks/.runtime/latest-eval.md`.
+6. Humans or agents promote durable lessons by updating `AGENTS.md` itself.
 
 That gives you a practical cycle of:
 
 `AGENTS.md -> prime.txt -> Copilot reads via AGENTS.md -> work happens -> hooks capture/evaluate -> durable learnings get written back to AGENTS.md`
+
+## Hook design
+
+GitHub hooks run synchronously and block the agent until the hook exits. This pack uses two different patterns depending on whether the hook output matters to the agent:
+
+| Hook | Pattern | Why |
+|---|---|---|
+| `sessionStart` | Synchronous | Agent must read `prime.txt` before starting work |
+| `userPromptSubmitted` | Synchronous | Log must be current before the next action |
+| `postToolUse` | Fire-and-forget | Pure logging; agent does not need to wait |
+| `errorOccurred` | Fire-and-forget | Pure logging; agent does not need to wait |
+| `sessionEnd` | Synchronous | Record and eval must complete before session teardown |
+
+Fire-and-forget hooks use this shell pattern:
+
+```bash
+PAYLOAD=$(cat); echo "$PAYLOAD" | node .github/hooks/markdown-self-learning.mjs postToolUse & disown $!
+```
+
+`$(cat)` reads stdin completely before the shell backgrounds the process, so the payload is never lost. `disown` removes the child from the shell job table so it survives the shell exiting.
+
+## Persistence model
+
+`.github/hooks/.runtime/` is git-ignored. This means `prime.txt`, `last-session.md`, `latest-eval.md`, and session records are **local to the current working tree** and do not persist across coding agent sessions, which use a fresh checkout each time.
+
+The only durable memory is `AGENTS.md`, which is committed to the repository. This is by design: the loop's job is to surface insights that belong in `AGENTS.md`, not to accumulate an ever-growing log of ephemeral sessions.
+
+If you want session records to persist across coding agent runs, commit them or push them to an external store. For most teams, keeping `AGENTS.md` well-maintained is sufficient.
 
 ## Eval loop
 

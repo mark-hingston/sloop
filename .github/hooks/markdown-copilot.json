@@ -22,19 +22,19 @@
     "postToolUse": [
       {
         "type": "command",
-        "bash": "node .github/hooks/markdown-self-learning.mjs postToolUse",
+        "bash": "PAYLOAD=$(cat); echo \"$PAYLOAD\" | node .github/hooks/markdown-self-learning.mjs postToolUse & disown $!",
         "powershell": "node .github/hooks/markdown-self-learning.mjs postToolUse",
         "cwd": ".",
-        "timeoutSec": 5
+        "timeoutSec": 2
       }
     ],
     "errorOccurred": [
       {
         "type": "command",
-        "bash": "node .github/hooks/markdown-self-learning.mjs errorOccurred",
+        "bash": "PAYLOAD=$(cat); echo \"$PAYLOAD\" | node .github/hooks/markdown-self-learning.mjs errorOccurred & disown $!",
         "powershell": "node .github/hooks/markdown-self-learning.mjs errorOccurred",
         "cwd": ".",
-        "timeoutSec": 5
+        "timeoutSec": 2
       }
     ],
     "sessionEnd": [
