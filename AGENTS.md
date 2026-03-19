@@ -5,7 +5,7 @@ Use this file as the repository's durable shared memory.
 ## At session start
 
 1. Read `.github/hooks/.runtime/prime.txt` if it exists — it contains the latest eval summary and last session handoff.
-2. Treat this file as the source of truth for durable repo guidance. `prime.txt` contains only session-specific additions — it does not repeat this file.
+2. Treat this file as the source of truth for durable guidance.
 
 ## While working
 
