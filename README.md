@@ -39,6 +39,43 @@ After that, copy `.github/hooks/`, `README.md`, and `AGENTS.md` into the target 
 
 ## How the loop works
 
+```mermaid
+sequenceDiagram
+    participant A as AGENTS.md
+    participant H as Hook runner
+    participant P as prime.txt
+    participant C as Copilot agent
+
+    Note over A,C: Session start
+    C->>H: sessionStart (sync)
+    H->>A: read AGENTS.md + last-session.md + latest-eval.md
+    H->>P: write prime.txt (snapshot)
+    H-->>C: done — agent reads prime.txt via AGENTS.md
+
+    Note over A,C: During session
+    C->>H: userPromptSubmitted (sync)
+    H->>H: append prompt to session log
+    H-->>C: done
+
+    C->>H: postToolUse / errorOccurred (async 🔥)
+    H-->>C: exits immediately
+    Note right of H: breadcrumbs written in background
+
+    Note over A,C: Session end
+    C->>H: sessionEnd (sync)
+    H->>H: write records/<session>.json + last-session.md
+    H->>P: refresh prime.txt
+    H-->>C: done
+    H--)H: spawn markdown-eval in background
+
+    Note over A,C: Background — after agent exits
+    H->>H: markdown-eval --record-outcomes
+    H->>H: write latest-eval.md
+
+    Note over A: Next session: agent updates AGENTS.md directly
+    C->>A: update AGENTS.md with durable learnings
+```
+
 1. `sessionStart` snapshots `AGENTS.md` and recent runtime summaries into `.github/hooks/.runtime/prime.txt`.
 2. `userPromptSubmitted` captures prompt breadcrumbs into the current session log. The agent waits for this hook so the log is current before the next tool call.
 3. `postToolUse` and `errorOccurred` append tool and error breadcrumbs **fire-and-forget**: stdin is captured into a shell variable, then piped to a backgrounded, disowned node process so the hook returns immediately. The agent does not wait.
