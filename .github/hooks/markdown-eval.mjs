@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 function parseArgs(argv) {
@@ -105,14 +106,12 @@ function computeScore(record) {
 	const changedFiles = getSectionLines(record.description, "## Changed files");
 	const toolLines = getSectionLines(record.description, "## Tool outcomes");
 	const hasCopilotOutcome = (record.outcomes ?? []).some((outcome) => outcome.agent === "github-copilot");
-	const agentsUpdated = record.metadata?.agentsUpdated === true;
 
 	let groundedness = 0;
 	if (changedFiles.length > 0 && changedFiles[0] !== "No changed files") groundedness += 2;
 	if (record.evidence?.file) groundedness += 1;
 
 	let reusability = 0;
-	if (agentsUpdated) reusability += 2;
 	if (changedFiles.length >= 2 && changedFiles[0] !== "No changed files") reusability += 1;
 
 	let specificity = 0;
@@ -129,13 +128,13 @@ function computeScore(record) {
 		specificity,
 		validationSignal,
 		total: groundedness + reusability + specificity + validationSignal,
-		max: 10,
+		max: 8,
 	};
 }
 
 function getRecommendation(score) {
-	if (score.total >= 8) return "promote";
-	if (score.total >= 5) return "review";
+	if (score.total >= 7) return "promote";
+	if (score.total >= 4) return "review";
 	return "discard";
 }
 
@@ -148,16 +147,13 @@ function buildReasons(record, score, recommendation) {
 	if (changedFiles.length > 0 && changedFiles[0] !== "No changed files") {
 		reasons.push(`grounded in ${changedFiles.length} changed file(s)`);
 	}
-	if (record.metadata?.agentsUpdated === true) {
-		reasons.push("updates durable AGENTS guidance");
-	}
 	if (promptLines.length > 0 && promptLines[0] !== "No prompts captured") {
 		reasons.push("includes prompt context");
 	}
 	if (toolLines.length > 0 && toolLines[0] !== "No tool usage captured") {
 		reasons.push("includes tool execution evidence");
 	}
-	if (score.total < 4) {
+	if (score.total < 3) {
 		reasons.push("weak grounding or low reusability signal");
 	}
 	if (recommendation === "promote") {
@@ -171,6 +167,7 @@ function evaluateRecord(record) {
 	const recommendation = getRecommendation(score);
 	const reasons = buildReasons(record, score, recommendation);
 	const alreadyEvaluated = (record.outcomes ?? []).some((outcome) => outcome.agent === "markdown-eval");
+	const alreadyPromoted = (record.outcomes ?? []).some((outcome) => outcome.agent === "markdown-promote");
 
 	return {
 		id: record.id ?? record.recorded_at ?? "(missing-id)",
@@ -180,7 +177,38 @@ function evaluateRecord(record) {
 		score,
 		reasons,
 		alreadyEvaluated,
+		alreadyPromoted,
 	};
+}
+
+function buildPromotionPrompt(record) {
+	const changedFiles = getSectionLines(record.description, "## Changed files");
+	const promptLines = getSectionLines(record.description, "## Prompt summary");
+	const toolLines = getSectionLines(record.description, "## Tool outcomes");
+
+	return [
+		"A Copilot session has been evaluated as worth promoting to durable knowledge.",
+		"",
+		"Session details:",
+		`- Prompts: ${promptLines.join("; ")}`,
+		`- Changed files: ${changedFiles.join(", ")}`,
+		`- Tool outcomes: ${toolLines.join("; ")}`,
+		"",
+		"Read AGENTS.md and update it with concise, reusable durable learnings from this session.",
+		"Only add facts that will be useful in future sessions and don't duplicate what's already there.",
+		"Keep entries short and specific, pointing at relevant files or subsystems where possible.",
+		"Do not add one-off plans, debugging breadcrumbs, or speculative notes.",
+	].join("\n");
+}
+
+function spawnPromotion(root, entry) {
+	const prompt = buildPromotionPrompt(entry.record);
+	const child = spawn(
+		"copilot",
+		["-p", prompt, "--yolo", "--silent"],
+		{ cwd: root, detached: true, stdio: "ignore" },
+	);
+	child.unref();
 }
 
 function formatMarkdown(results) {
@@ -201,6 +229,9 @@ function formatMarkdown(results) {
 		);
 		if (result.alreadyEvaluated) {
 			lines.push("- Existing eval outcome: yes");
+		}
+		if (result.alreadyPromoted) {
+			lines.push("- AGENTS promotion: yes");
 		}
 		lines.push(`- Reasons: ${result.reasons.join("; ")}`, "");
 	}
@@ -236,18 +267,28 @@ async function appendEvalOutcome(entry, result) {
 				? "partial"
 				: "failure";
 
+	const newOutcomes = [
+		{
+			status,
+			agent: "markdown-eval",
+			notes: `recommendation=${result.recommendation}; reasons=${result.reasons.join(", ")}`,
+			test_results: `score=${result.score.total}/${result.score.max}`,
+			recorded_at: new Date().toISOString(),
+		},
+	];
+
+	if (result.recommendation === "promote" && !result.alreadyPromoted) {
+		newOutcomes.push({
+			status: "pending",
+			agent: "markdown-promote",
+			notes: "AGENTS.md update queued for LLM promotion",
+			recorded_at: new Date().toISOString(),
+		});
+	}
+
 	const updated = {
 		...entry.record,
-		outcomes: [
-			...(entry.record.outcomes ?? []),
-			{
-				status,
-				agent: "markdown-eval",
-				notes: `recommendation=${result.recommendation}; reasons=${result.reasons.join(", ")}`,
-				test_results: `score=${result.score.total}/${result.score.max}`,
-				recorded_at: new Date().toISOString(),
-			},
-		],
+		outcomes: [...(entry.record.outcomes ?? []), ...newOutcomes],
 	};
 
 	await writeFile(entry.path, `${JSON.stringify(updated, null, 2)}\n`, "utf-8");
@@ -264,12 +305,17 @@ async function main() {
 	const entries = await readRecords(options.limit);
 	const results = entries.map((entry) => evaluateRecord(entry.record));
 	let outcomesAppended = 0;
+	let promotionsSpawned = 0;
 
 	if (options.recordOutcomes) {
 		for (let index = 0; index < entries.length; index += 1) {
 			const appended = await appendEvalOutcome(entries[index], results[index]);
 			if (appended) {
 				outcomesAppended += 1;
+				if (results[index].recommendation === "promote" && !results[index].alreadyPromoted) {
+					spawnPromotion(process.cwd(), entries[index]);
+					promotionsSpawned += 1;
+				}
 			}
 		}
 	}
@@ -296,6 +342,9 @@ async function main() {
 	console.log(markdown);
 	if (options.recordOutcomes) {
 		console.log(`\nRecorded ${outcomesAppended} markdown-eval outcome(s).`);
+		if (promotionsSpawned > 0) {
+			console.log(`Spawned ${promotionsSpawned} AGENTS.md promotion(s).`);
+		}
 	}
 }
 

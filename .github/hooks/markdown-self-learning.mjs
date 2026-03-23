@@ -210,19 +210,20 @@ function spawnBackgroundEval(root) {
 	child.unref();
 }
 
-async function getChangedFiles(root) {
+async function getChangedFiles(root, baseline) {
 	const statusResult = await runGit(root, ["status", "--short", "--untracked-files=all"]);
 	if (!statusResult.ok) {
 		return [];
 	}
 
+	const baselineSet = new Set(baseline ?? []);
 	const changed = new Set();
 	for (const line of statusResult.stdout.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		const candidate = line.slice(3).trim();
 		if (!candidate) continue;
 		const filePath = candidate.includes(" -> ") ? candidate.split(" -> ").at(-1) : candidate;
-		if (filePath) {
+		if (filePath && !baselineSet.has(filePath)) {
 			changed.add(filePath);
 		}
 	}
@@ -342,6 +343,12 @@ function buildSessionMarkdown(state, promptSummary, changedFiles, toolSummary, f
 
 async function handleSessionStart(root, payload) {
 	const state = await ensureSessionState(root, payload);
+
+	// Snapshot already-changed files so they can be excluded from the session's changed-files report.
+	const baselineFiles = await getChangedFiles(root);
+	state.baselineFiles = baselineFiles;
+	await writeSessionState(statePathFor(root), state);
+
 	await appendEvent(state.logPath, "sessionStart", {
 		source: payload.source ?? "unknown",
 		initialPrompt: excerpt(payload.initialPrompt, 240),
@@ -390,7 +397,7 @@ async function handleSessionEnd(root, payload) {
 		.filter((event) => event.event === "userPromptSubmitted")
 		.map((event) => (typeof event.details.prompt === "string" ? event.details.prompt : undefined))
 		.filter(Boolean);
-	const changedFiles = await getChangedFiles(root);
+	const changedFiles = await getChangedFiles(root, state.baselineFiles ?? []);
 	const toolSummary = summarizeTools(events);
 	const failureSummary = summarizeFailures(events);
 	const agentsUpdated = changedFiles.includes("AGENTS.md");
