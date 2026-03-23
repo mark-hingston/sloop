@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -101,6 +102,10 @@ function getSectionLines(description, heading) {
 	return collected;
 }
 
+function isDurableFile(filePath) {
+	return filePath === "AGENTS.md" || filePath.startsWith("docs/");
+}
+
 function computeScore(record) {
 	const promptLines = getSectionLines(record.description, "## Prompt summary");
 	const changedFiles = getSectionLines(record.description, "## Changed files");
@@ -112,7 +117,8 @@ function computeScore(record) {
 	if (record.evidence?.file) groundedness += 1;
 
 	let reusability = 0;
-	if (changedFiles.length >= 2 && changedFiles[0] !== "No changed files") reusability += 1;
+	const durableChanges = changedFiles.filter((f) => f !== "No changed files" && isDurableFile(f));
+	if (durableChanges.length > 0) reusability += 1;
 
 	let specificity = 0;
 	if (promptLines.length > 0 && promptLines[0] !== "No prompts captured") specificity += 1;
@@ -157,7 +163,7 @@ function buildReasons(record, score, recommendation) {
 		reasons.push("weak grounding or low reusability signal");
 	}
 	if (recommendation === "promote") {
-		reasons.push("strong candidate to keep reflected in AGENTS");
+		reasons.push("strong candidate to keep reflected in durable docs (AGENTS.md or docs/)");
 	}
 	return reasons;
 }
@@ -181,28 +187,27 @@ function evaluateRecord(record) {
 	};
 }
 
-function buildPromotionPrompt(record) {
+async function buildPromotionPrompt(root, record) {
+	const templatePath = join(root, ".github", "hooks", "prompts", "promote-learnings.md");
+	if (!existsSync(templatePath)) {
+		console.warn(`promote-learnings.md not found at ${templatePath} — skipping promotion`);
+		return null;
+	}
+
+	const template = await readFile(templatePath, "utf-8");
 	const changedFiles = getSectionLines(record.description, "## Changed files");
 	const promptLines = getSectionLines(record.description, "## Prompt summary");
 	const toolLines = getSectionLines(record.description, "## Tool outcomes");
 
-	return [
-		"A Copilot session has been evaluated as worth promoting to durable knowledge.",
-		"",
-		"Session details:",
-		`- Prompts: ${promptLines.join("; ")}`,
-		`- Changed files: ${changedFiles.join(", ")}`,
-		`- Tool outcomes: ${toolLines.join("; ")}`,
-		"",
-		"Read AGENTS.md and update it with concise, reusable durable learnings from this session.",
-		"Only add facts that will be useful in future sessions and don't duplicate what's already there.",
-		"Keep entries short and specific, pointing at relevant files or subsystems where possible.",
-		"Do not add one-off plans, debugging breadcrumbs, or speculative notes.",
-	].join("\n");
+	return template
+		.replace("{{prompts}}", promptLines.join("; ") || "none")
+		.replace("{{changedFiles}}", changedFiles.join(", ") || "none")
+		.replace("{{toolOutcomes}}", toolLines.join("; ") || "none");
 }
 
-function spawnPromotion(root, entry) {
-	const prompt = buildPromotionPrompt(entry.record);
+async function spawnPromotion(root, entry) {
+	const prompt = await buildPromotionPrompt(root, entry.record);
+	if (!prompt) return;
 	const child = spawn(
 		"copilot",
 		["-p", prompt, "--yolo", "--silent"],
@@ -313,7 +318,7 @@ async function main() {
 			if (appended) {
 				outcomesAppended += 1;
 				if (results[index].recommendation === "promote" && !results[index].alreadyPromoted) {
-					spawnPromotion(process.cwd(), entries[index]);
+					await spawnPromotion(process.cwd(), entries[index]);
 					promotionsSpawned += 1;
 				}
 			}

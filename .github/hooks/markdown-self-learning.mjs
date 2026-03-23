@@ -322,7 +322,7 @@ function buildSessionMarkdown(state, promptSummary, changedFiles, toolSummary, f
 		`- Session: ${state.sessionId}`,
 		`- Started: ${state.startedAt}`,
 		`- End reason: ${reason ?? "unknown"}`,
-		`- AGENTS updated: ${agentsUpdated ? "yes" : "no"}`,
+		`- Durable docs updated: ${agentsUpdated ? "yes" : "no"}`,
 		"",
 		"## Prompt summary",
 		...(promptSummary.length > 0 ? promptSummary.map((prompt) => `- ${prompt}`) : ["- No prompts captured"]),
@@ -400,7 +400,7 @@ async function handleSessionEnd(root, payload) {
 	const changedFiles = await getChangedFiles(root, state.baselineFiles ?? []);
 	const toolSummary = summarizeTools(events);
 	const failureSummary = summarizeFailures(events);
-	const agentsUpdated = changedFiles.includes("AGENTS.md");
+	const agentsUpdated = changedFiles.some((f) => f === "AGENTS.md" || f.startsWith("docs/"));
 
 	if (changedFiles.length === 0 && promptSummary.length === 0 && failureSummary.length === 0) {
 		await writeSessionState(statePathFor(root), null);
