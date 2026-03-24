@@ -27,6 +27,7 @@ See [docs/learning-guide.md](docs/learning-guide.md) for full guidance on what b
 | `.github/hooks/markdown-self-learning.mjs` | Hook runner — captures session events and writes records |
 | `.github/hooks/markdown-eval.mjs` | Evaluator — scores records and triggers promotions |
 | `.github/hooks/prompts/promote-learnings.md` | Prompt template used when spawning a learning promotion |
+| `.github/hooks/prompts/synthesise-learnings.md` | Prompt template used for batch synthesis of review-tier sessions |
 | `AGENTS.md` | Top-level durable memory — Copilot reads and updates this |
 | `docs/` | Deep-dive docs linked from `AGENTS.md` |
 
@@ -79,8 +80,22 @@ You can also run the evaluator manually:
 node .github/hooks/markdown-eval.mjs
 node .github/hooks/markdown-eval.mjs --json
 node .github/hooks/markdown-eval.mjs --record-outcomes
+node .github/hooks/markdown-eval.mjs --semantic
+node .github/hooks/markdown-eval.mjs --synthesise
 node .github/hooks/markdown-eval.mjs --limit 5
 ```
+
+## Learning quality features
+
+Four mechanisms improve the signal-to-noise ratio of what gets promoted to durable docs.
+
+**Knowledge type classification** — every session record is automatically classified into one or more types (`architecture`, `frontend`, `testing`, `infrastructure`, `workflow`, `decision`) based on **file extensions and prompt keywords** — no hardcoded directory paths, so it works in any repo without modification. Types are stored in `record.metadata.knowledgeTypes[]` and included in `prime.txt` as a `## Knowledge context` section so future sessions start with awareness of recent focus areas.
+
+**Content classifier penalty** — before a session is promoted, a lightweight check detects if ≥75% of captured prompts are questions or meta-talk (phrases like *"what is"*, *"can you"*, *"let me"*). If so, the eval score is reduced by 1, preventing exploratory conversations from being falsely promoted. Shown in the eval output as `classifier penalty -1`.
+
+**Jaccard deduplication before synthesis** — before batching review-tier sessions for synthesis, a Jaccard similarity pass (threshold: 0.7) removes near-duplicate sessions, keeping only the higher-scoring representative. This avoids the synthesis agent seeing the same topic multiple times.
+
+**Superseding guidance** — the promote and synthesise prompts instruct the agent to remove stale guidance rather than append to it, and to note what was replaced inline as *(supersedes: …)*. This keeps `AGENTS.md` lean and prevents contradictory guidance accumulating over time.
 
 ## What belongs where
 

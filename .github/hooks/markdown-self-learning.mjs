@@ -308,6 +308,41 @@ async function refreshPrimeFile(root, state) {
 		primeSections.push("", "## Latest session handoff", latestSession.trim());
 	}
 
+	const recordsDir = recordsDirFor(root);
+	if (existsSync(recordsDir)) {
+		try {
+			const recordFiles = (await readdir(recordsDir))
+				.filter((f) => f.endsWith(".json"))
+				.sort()
+				.slice(-3)
+				.reverse();
+
+			const allTypes = new Set();
+			for (const file of recordFiles) {
+				try {
+					const raw = await readFile(join(recordsDir, file), "utf-8");
+					const rec = JSON.parse(raw);
+					const types = rec?.metadata?.knowledgeTypes;
+					if (Array.isArray(types)) {
+						for (const t of types) allTypes.add(t);
+					}
+				} catch {
+					// ignore malformed records
+				}
+			}
+
+			if (allTypes.size > 0) {
+				primeSections.push(
+					"",
+					"## Knowledge context",
+					`Active areas in recent sessions: ${[...allTypes].join(", ")}`,
+				);
+			}
+		} catch {
+			// ignore unreadable records dir
+		}
+	}
+
 	if (!latestEval.trim() && !latestSession.trim()) {
 		primeSections.push("", "_No previous session history yet._");
 	}
@@ -339,6 +374,47 @@ function buildSessionMarkdown(state, promptSummary, changedFiles, toolSummary, f
 	}
 
 	return lines.join("\n");
+}
+
+function classifySession(changedFiles, prompts) {
+	const files = changedFiles.join("\n").toLowerCase();
+	const text = prompts.join("\n").toLowerCase();
+	const types = [];
+
+	// Backend source file extensions (language-agnostic, excludes test files)
+	if (
+		/\.(cs|go|java|py|rb|rs|php|kt|swift|ex|exs|clj|scala)(\s|$)/.test(files) ||
+		/architect|infrastructure|provider|processor|database|backend/.test(text)
+	) {
+		types.push("architecture");
+	}
+
+	// Web UI file extensions
+	if (/\.(tsx|jsx|vue|svelte|css|scss|less|sass)(\s|$)/.test(files)) {
+		types.push("frontend");
+	}
+
+	// Test file conventions (universal across frameworks)
+	if (/\.spec\.|\.test\.|playwright|jest|vitest|cypress/.test(files)) {
+		types.push("testing");
+	}
+
+	// IaC and container tooling
+	if (/docker|\.tf\b|\.bicep\b|\.ya?ml$/.test(files) && /kubernetes|terraform|bicep|compose|tilt|deploy|infra/.test(files + text)) {
+		types.push("infrastructure");
+	}
+
+	// Docs and config (universal)
+	if (/docs\/|agents\.md|\.github\//.test(files)) {
+		types.push("workflow");
+	}
+
+	// Prompt keyword classification (always portable)
+	if (/migrat|chose|decided|switch|replac|moved to|adopt|because|due to/.test(text)) {
+		types.push("decision");
+	}
+
+	return types.length > 0 ? types : ["general"];
 }
 
 async function handleSessionStart(root, payload) {
@@ -424,7 +500,7 @@ async function handleSessionEnd(root, payload) {
 		classification: "tactical",
 		recorded_at: new Date().toISOString(),
 		files: changedFiles.slice(0, 25),
-		tags: ["copilot", "hooks", "self-learning", "markdown", "session"],
+		tags: ["copilot", "hooks", "self-learning", "markdown", "session", ...classifySession(changedFiles, promptSummary)],
 		evidence: {
 			date: state.startedAt,
 			...(changedFiles[0] ? { file: changedFiles[0] } : {}),
@@ -433,6 +509,7 @@ async function handleSessionEnd(root, payload) {
 			agentsUpdated,
 			promptCount: promptSummary.length,
 			toolCount: toolSummary.length,
+			knowledgeTypes: classifySession(changedFiles, promptSummary),
 		},
 		outcomes: [
 			{

@@ -2,12 +2,14 @@
 
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { join } from "node:path";
 
 function parseArgs(argv) {
 	let json = false;
 	let recordOutcomes = false;
+	let semantic = false;
+	let synthesise = false;
 	let limit = null;
 
 	for (let i = 0; i < argv.length; i += 1) {
@@ -29,6 +31,16 @@ function parseArgs(argv) {
 			continue;
 		}
 
+		if (arg === "--semantic") {
+			semantic = true;
+			continue;
+		}
+
+		if (arg === "--synthesise") {
+			synthesise = true;
+			continue;
+		}
+
 		if (arg === "--limit") {
 			const next = argv[i + 1];
 			if (!next) {
@@ -46,19 +58,26 @@ function parseArgs(argv) {
 		throw new Error(`Unknown argument: ${arg}`);
 	}
 
-	return { json, recordOutcomes, limit };
+	return { json, recordOutcomes, semantic, synthesise, limit };
 }
 
 function printHelp() {
 	console.log(`Markdown self-learning eval
 
 Usage:
-  node .github/hooks/markdown-eval.mjs [--json] [--record-outcomes] [--limit N]
+  node .github/hooks/markdown-eval.mjs [--json] [--record-outcomes] [--semantic] [--synthesise] [--limit N]
 
 Options:
   --json             Output structured JSON
   --record-outcomes  Append markdown-eval outcomes to record files
+  --semantic         Enrich records with LLM-based semantic quality score (requires gh auth)
+  --synthesise       Batch synthesise review-tier sessions into durable docs (min ${SYNTHESISE_MIN_RECORDS})
+                     Near-duplicate sessions are deduplicated via Jaccard similarity (threshold 0.7) before batching.
   --limit N          Evaluate only the most recent N records
+
+Scoring:
+  groundedness (0–3), reusability (0–2), specificity (0–2), validation (0–2), semantic (0–2), max 11
+  Classifier penalty: -1 applied when >75% of prompt lines are questions or meta-talk (classifierPenalty in JSON output).
 `);
 }
 
@@ -106,6 +125,105 @@ function isDurableFile(filePath) {
 	return filePath === "AGENTS.md" || filePath.startsWith("docs/");
 }
 
+function buildSemanticScoringPrompt(record) {
+	return `You are evaluating a Copilot agent session record to decide if its learnings are worth promoting to durable project documentation (AGENTS.md or docs/).
+
+Score the session on two dimensions, each 0 or 1:
+
+**actionability** (0 or 1)
+- 1 if the session contains specific, codebase-relevant guidance that would change how a future agent approaches similar work
+- 0 if it is generic, trivial, or contains no reusable insight
+
+**gap_detection** (0 or 1)
+- 1 if the session surfaces a pattern, failure, or convention that is likely missing from or underspecified in existing project docs
+- 0 if the learnings are already well-covered or too narrow to generalise
+
+Return ONLY valid JSON in this exact shape — no markdown, no explanation:
+{"actionability": 0_or_1, "gap_detection": 0_or_1, "reason": "one sentence"}
+
+Session record:
+${record.description ?? "(no description)"}`;
+}
+
+async function fetchSemanticScore(record, root) {
+	// Skip if already scored this session
+	if (record.metadata?.semanticScore) {
+		return null;
+	}
+
+	let token;
+	try {
+		token = execSync("gh auth token", { cwd: root, encoding: "utf-8" }).trim();
+	} catch {
+		return null;
+	}
+
+	if (!token) return null;
+
+	try {
+		const response = await fetch("https://models.inference.ai.azure.com/chat/completions", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				model: "openai/gpt-4o-mini",
+				messages: [{ role: "user", content: buildSemanticScoringPrompt(record) }],
+				response_format: { type: "json_object" },
+				max_tokens: 120,
+				temperature: 0,
+			}),
+		});
+
+		if (!response.ok) return null;
+
+		const data = await response.json();
+		const raw = data.choices?.[0]?.message?.content;
+		if (!raw) return null;
+
+		const parsed = JSON.parse(raw);
+		const actionability = parsed.actionability === 1 ? 1 : 0;
+		const gapDetection = parsed.gap_detection === 1 ? 1 : 0;
+
+		return {
+			score: actionability + gapDetection,
+			actionability,
+			gapDetection,
+			reason: typeof parsed.reason === "string" ? parsed.reason : "",
+			scoredAt: new Date().toISOString(),
+		};
+	} catch {
+		return null;
+	}
+}
+
+
+function classifyPromptQuality(promptLines) {
+	if (promptLines.length === 0) return { penalty: 0 };
+
+	const META_PATTERNS = [
+		/^\s*let me\b/i,
+		/^\s*i think\b/i,
+		/^\s*maybe\b/i,
+		/^\s*can you\b/i,
+		/^\s*could you\b/i,
+		/^\s*what (is|are|do|does|should)\b/i,
+		/^\s*how (do|does|can|should)\b/i,
+		/^\s*is there\b/i,
+		/^\s*are there\b/i,
+		/\?$/, // ends with question mark
+	];
+
+	const metaCount = promptLines.filter((line) =>
+		META_PATTERNS.some((p) => p.test(line)),
+	).length;
+
+	const metaRatio = metaCount / promptLines.length;
+	// Apply penalty of 1 if >75% of prompts look like questions/meta-talk
+	return { penalty: metaRatio >= 0.75 ? 1 : 0, metaRatio: Math.round(metaRatio * 100) };
+}
+
 function computeScore(record) {
 	const promptLines = getSectionLines(record.description, "## Prompt summary");
 	const changedFiles = getSectionLines(record.description, "## Changed files");
@@ -119,6 +237,7 @@ function computeScore(record) {
 	let reusability = 0;
 	const durableChanges = changedFiles.filter((f) => f !== "No changed files" && isDurableFile(f));
 	if (durableChanges.length > 0) reusability += 1;
+	if (durableChanges.includes("AGENTS.md") || durableChanges.length >= 2) reusability += 1;
 
 	let specificity = 0;
 	if (promptLines.length > 0 && promptLines[0] !== "No prompts captured") specificity += 1;
@@ -128,13 +247,20 @@ function computeScore(record) {
 	if (hasCopilotOutcome) validationSignal += 1;
 	if (toolLines.length > 0 && toolLines[0] !== "No tool usage captured") validationSignal += 1;
 
+	const semanticQuality = record.metadata?.semanticScore?.score ?? 0;
+
+	const promptQuality = classifyPromptQuality(promptLines);
+	const classifierPenalty = promptQuality.penalty;
+
 	return {
 		groundedness,
 		reusability,
 		specificity,
 		validationSignal,
-		total: groundedness + reusability + specificity + validationSignal,
-		max: 8,
+		semanticQuality,
+		classifierPenalty,
+		total: Math.max(0, groundedness + reusability + specificity + validationSignal + semanticQuality - classifierPenalty),
+		max: 11,
 	};
 }
 
@@ -199,10 +325,15 @@ async function buildPromotionPrompt(root, record) {
 	const promptLines = getSectionLines(record.description, "## Prompt summary");
 	const toolLines = getSectionLines(record.description, "## Tool outcomes");
 
+	const knowledgeTypes = Array.isArray(record.metadata?.knowledgeTypes)
+		? record.metadata.knowledgeTypes.join(", ")
+		: "general";
+
 	return template
 		.replace("{{prompts}}", promptLines.join("; ") || "none")
 		.replace("{{changedFiles}}", changedFiles.join(", ") || "none")
-		.replace("{{toolOutcomes}}", toolLines.join("; ") || "none");
+		.replace("{{toolOutcomes}}", toolLines.join("; ") || "none")
+		.replace("{{knowledgeTypes}}", knowledgeTypes);
 }
 
 async function spawnPromotion(root, entry) {
@@ -216,7 +347,161 @@ async function spawnPromotion(root, entry) {
 	child.unref();
 }
 
-function formatMarkdown(results) {
+const SYNTHESISE_MIN_RECORDS = 3;
+
+function collectReviewCandidates(entries, results) {
+	return entries.filter((entry, index) => {
+		if (results[index].recommendation !== "review") return false;
+		const alreadySynthesised = (entry.record.outcomes ?? []).some(
+			(o) => o.agent === "markdown-synthesise",
+		);
+		return !alreadySynthesised;
+	});
+}
+
+function tokenize(text) {
+	if (!text) return new Set();
+	return new Set(
+		text
+			.toLowerCase()
+			.replace(/[^\w\s]/g, " ")
+			.split(/\s+/)
+			.filter((t) => t.length > 3),
+	);
+}
+
+function jaccardSimilarity(setA, setB) {
+	if (setA.size === 0 && setB.size === 0) return 1;
+	const intersection = new Set([...setA].filter((x) => setB.has(x)));
+	const union = new Set([...setA, ...setB]);
+	return union.size === 0 ? 0 : intersection.size / union.size;
+}
+
+function deduplicateByJaccard(reviewEntries, results, threshold = 0.7) {
+	// Build token sets from description + prompts for each entry
+	const tokenSets = reviewEntries.map((entry) => {
+		const promptLines = getSectionLines(entry.record.description, "## Prompt summary");
+		const text = [entry.record.description ?? "", ...promptLines].join(" ");
+		return tokenize(text);
+	});
+
+	// Find the eval score for each entry (from outcomes or results array)
+	const scores = reviewEntries.map((entry, i) => {
+		const evalOutcome = (entry.record.outcomes ?? []).find((o) => o.agent === "markdown-eval");
+		if (evalOutcome) {
+			const match = evalOutcome.test_results?.match(/score=(\d+)/);
+			return match ? Number.parseInt(match[1], 10) : 0;
+		}
+		return results[i]?.score?.total ?? 0;
+	});
+
+	const kept = new Set(reviewEntries.map((_, i) => i));
+
+	for (let i = 0; i < reviewEntries.length; i++) {
+		if (!kept.has(i)) continue;
+		for (let j = i + 1; j < reviewEntries.length; j++) {
+			if (!kept.has(j)) continue;
+			const sim = jaccardSimilarity(tokenSets[i], tokenSets[j]);
+			if (sim >= threshold) {
+				// Drop the lower-scored one; keep the higher
+				const dropIndex = scores[i] >= scores[j] ? j : i;
+				kept.delete(dropIndex);
+			}
+		}
+	}
+
+	const deduplicated = reviewEntries.filter((_, i) => kept.has(i));
+	const removed = reviewEntries.length - deduplicated.length;
+	return { deduplicated, removed };
+}
+
+function formatReviewSessionsForPrompt(entries) {
+	return entries
+		.map((entry, index) => {
+			const r = entry.record;
+			const date = r.evidence?.date ?? r.recorded_at ?? "unknown";
+			return `### Session ${index + 1} (${date})\n${r.description ?? "(no description)"}`;
+		})
+		.join("\n\n---\n\n");
+}
+
+async function spawnSynthesis(root, reviewEntries) {
+	const templatePath = join(root, ".github", "hooks", "prompts", "synthesise-learnings.md");
+	if (!existsSync(templatePath)) {
+		console.warn("synthesise-learnings.md not found — skipping synthesis");
+		return false;
+	}
+
+	const template = await readFile(templatePath, "utf-8");
+	const prompt = template.replace("{{reviewSessions}}", formatReviewSessionsForPrompt(reviewEntries));
+
+	const child = spawn("copilot", ["-p", prompt, "--yolo", "--silent"], {
+		cwd: root,
+		detached: true,
+		stdio: "ignore",
+	});
+	child.unref();
+	return true;
+}
+
+async function markSynthesised(entries) {
+	const outcome = {
+		status: "pending",
+		agent: "markdown-synthesise",
+		notes: "Included in batch synthesis — patterns promoted via synthesise-learnings.md",
+		recorded_at: new Date().toISOString(),
+	};
+	for (const entry of entries) {
+		const updated = {
+			...entry.record,
+			outcomes: [...(entry.record.outcomes ?? []), outcome],
+		};
+		await writeFile(entry.path, `${JSON.stringify(updated, null, 2)}\n`, "utf-8");
+	}
+}
+
+function computeImprovementSignal(entries) {
+	// Group records by their primary durable file area
+	const groups = new Map();
+
+	for (const entry of entries) {
+		const r = entry.record;
+		const score = (r.outcomes ?? []).find((o) => o.agent === "markdown-eval")?.test_results;
+		if (!score) continue;
+
+		const match = score.match(/score=(\d+)\/(\d+)/);
+		if (!match) continue;
+		const total = Number.parseInt(match[1], 10);
+		const max = Number.parseInt(match[2], 10);
+		const pct = max > 0 ? total / max : 0;
+
+		const durableFiles = (r.files ?? []).filter(isDurableFile);
+		const area = durableFiles.length > 0
+			? durableFiles[0].replace(/^docs\/([^/]+).*/, "docs/$1").replace(/^(AGENTS\.md)$/, "AGENTS.md")
+			: "general";
+
+		if (!groups.has(area)) groups.set(area, []);
+		groups.get(area).push({ pct, recorded_at: r.recorded_at ?? "" });
+	}
+
+	const signals = [];
+	for (const [area, scores] of groups) {
+		if (scores.length < 3) continue;
+
+		const sorted = [...scores].sort((a, b) => a.recorded_at.localeCompare(b.recorded_at));
+		const third = Math.max(1, Math.floor(sorted.length / 3));
+		const early = sorted.slice(0, third).reduce((s, x) => s + x.pct, 0) / third;
+		const recent = sorted.slice(-third).reduce((s, x) => s + x.pct, 0) / third;
+		const delta = recent - early;
+
+		const trend = delta > 0.08 ? "improving ↑" : delta < -0.08 ? "declining ↓" : "stable →";
+		signals.push({ area, trend, early: Math.round(early * 100), recent: Math.round(recent * 100), count: scores.length });
+	}
+
+	return signals;
+}
+
+function formatMarkdown(results, improvementSignal = []) {
 	if (results.length === 0) {
 		return "# Markdown eval report\n\nNo records found.";
 	}
@@ -230,7 +515,7 @@ function formatMarkdown(results) {
 			`- ID: \`${result.id}\``,
 			`- Recorded: ${result.recordedAt}`,
 			`- Recommendation: **${result.recommendation}**`,
-			`- Score: ${result.score.total}/${result.score.max} (groundedness ${result.score.groundedness}, reusability ${result.score.reusability}, specificity ${result.score.specificity}, validation ${result.score.validationSignal})`,
+			`- Score: ${result.score.total}/${result.score.max} (groundedness ${result.score.groundedness}, reusability ${result.score.reusability}, specificity ${result.score.specificity}, validation ${result.score.validationSignal}, semantic ${result.score.semanticQuality}${result.score.classifierPenalty > 0 ? `, classifier penalty -${result.score.classifierPenalty}` : ""})`,
 		);
 		if (result.alreadyEvaluated) {
 			lines.push("- Existing eval outcome: yes");
@@ -239,6 +524,14 @@ function formatMarkdown(results) {
 			lines.push("- AGENTS promotion: yes");
 		}
 		lines.push(`- Reasons: ${result.reasons.join("; ")}`, "");
+	}
+
+	if (improvementSignal.length > 0) {
+		lines.push("## Improvement signal", "");
+		for (const s of improvementSignal) {
+			lines.push(`- **${s.area}**: ${s.trend} (${s.early}% → ${s.recent}% avg score, ${s.count} sessions)`);
+		}
+		lines.push("");
 	}
 
 	return lines.join("\n");
@@ -305,27 +598,108 @@ async function writeLatestEvalReport(markdown) {
 	await writeFile(latestEvalPath(), `${markdown}\n`, "utf-8");
 }
 
+async function verifyPendingPromotions(entries) {
+	let verified = 0;
+	for (const entry of entries) {
+		const pendingPromotion = (entry.record.outcomes ?? []).find(
+			(o) => o.agent === "markdown-promote" && o.status === "pending",
+		);
+		if (!pendingPromotion) continue;
+
+		let hasChanges = false;
+		try {
+			const result = execSync(
+				`git log --oneline --since="${pendingPromotion.recorded_at}" -- AGENTS.md docs/`,
+				{ cwd: process.cwd(), encoding: "utf-8" },
+			).trim();
+			hasChanges = result.length > 0;
+		} catch {
+			continue;
+		}
+
+		if (!hasChanges) continue;
+
+		const updatedOutcomes = (entry.record.outcomes ?? []).map((o) =>
+			o.agent === "markdown-promote" && o.status === "pending"
+				? {
+						...o,
+						status: "success",
+						notes: `${o.notes} — verified: durable docs changed after promotion`,
+						verified_at: new Date().toISOString(),
+					}
+				: o,
+		);
+		await writeFile(entry.path, `${JSON.stringify({ ...entry.record, outcomes: updatedOutcomes }, null, 2)}\n`, "utf-8");
+		verified += 1;
+	}
+	return verified;
+}
+
 async function main() {
 	const options = parseArgs(process.argv.slice(2));
+	const root = process.cwd();
 	const entries = await readRecords(options.limit);
+
+	// Semantic enrichment: enrich records that haven't been scored yet (stored in metadata, called once per record)
+	let semanticScored = 0;
+	if (options.semantic) {
+		for (const entry of entries) {
+			const semanticScore = await fetchSemanticScore(entry.record, root);
+			if (semanticScore) {
+				const updated = {
+					...entry.record,
+					metadata: { ...(entry.record.metadata ?? {}), semanticScore },
+				};
+				await writeFile(entry.path, `${JSON.stringify(updated, null, 2)}\n`, "utf-8");
+				entry.record = updated;
+				semanticScored += 1;
+			}
+		}
+	}
+
 	const results = entries.map((entry) => evaluateRecord(entry.record));
+
+	// Improvement signal: always computed, surfaces score trends per file area
+	const improvementSignal = computeImprovementSignal(entries);
+
 	let outcomesAppended = 0;
 	let promotionsSpawned = 0;
+	let verificationsResolved = 0;
 
 	if (options.recordOutcomes) {
+		verificationsResolved = await verifyPendingPromotions(entries);
 		for (let index = 0; index < entries.length; index += 1) {
 			const appended = await appendEvalOutcome(entries[index], results[index]);
 			if (appended) {
 				outcomesAppended += 1;
 				if (results[index].recommendation === "promote" && !results[index].alreadyPromoted) {
-					await spawnPromotion(process.cwd(), entries[index]);
+					await spawnPromotion(root, entries[index]);
 					promotionsSpawned += 1;
 				}
 			}
 		}
 	}
 
-	const markdown = formatMarkdown(results);
+	// Synthesise: batch review-tier sessions into durable patterns when threshold is met
+	let synthesisBatched = 0;
+	let uniqueCandidates = [];
+	let jaccardRemoved = 0;
+	if (options.synthesise) {
+		const reviewCandidates = collectReviewCandidates(entries, results);
+		({ deduplicated: uniqueCandidates, removed: jaccardRemoved } = deduplicateByJaccard(reviewCandidates, results));
+		if (uniqueCandidates.length >= SYNTHESISE_MIN_RECORDS) {
+			const spawned = await spawnSynthesis(root, uniqueCandidates);
+			if (spawned) {
+				await markSynthesised(uniqueCandidates);
+				synthesisBatched = uniqueCandidates.length;
+			}
+		}
+		if (jaccardRemoved > 0 && !options.json) {
+			console.log(`\nJaccard dedup: removed ${jaccardRemoved} near-duplicate review session(s) before synthesis.`);
+		}
+	}
+
+	const markdown = formatMarkdown(results, improvementSignal);
 	await writeLatestEvalReport(markdown);
 
 	if (options.json) {
@@ -336,6 +710,9 @@ async function main() {
 					command: "markdown-eval",
 					results,
 					outcomesAppended,
+					semanticScored,
+					synthesisBatched,
+					improvementSignal,
 				},
 				null,
 				2,
@@ -345,8 +722,21 @@ async function main() {
 	}
 
 	console.log(markdown);
+	if (options.semantic && semanticScored > 0) {
+		console.log(`\nSemantically scored ${semanticScored} record(s).`);
+	}
+	if (options.synthesise) {
+		if (synthesisBatched > 0) {
+			console.log(`\nBatched ${synthesisBatched} review session(s) into synthesis.`);
+		} else {
+			console.log(`\nSynthesis skipped — ${uniqueCandidates.length}/${SYNTHESISE_MIN_RECORDS} unique review sessions available after Jaccard dedup (need ${SYNTHESISE_MIN_RECORDS}).`);
+		}
+	}
 	if (options.recordOutcomes) {
 		console.log(`\nRecorded ${outcomesAppended} markdown-eval outcome(s).`);
+		if (verificationsResolved > 0) {
+			console.log(`Verified ${verificationsResolved} pending promotion(s).`);
+		}
 		if (promotionsSpawned > 0) {
 			console.log(`Spawned ${promotionsSpawned} AGENTS.md promotion(s).`);
 		}

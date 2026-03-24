@@ -32,7 +32,8 @@ sequenceDiagram
     Note over A,C: Session start
     C->>H: sessionStart (sync)
     H->>A: read last-session.md + latest-eval.md
-    H->>P: write prime.txt (eval + session history only)
+    H->>H: read last 3 session records for knowledge context
+    H->>P: write prime.txt (eval + session history + knowledge context)
     H-->>C: done — agent reads AGENTS.md + docs/ directly, prime.txt for session context
 
     Note over A,C: During session
@@ -47,7 +48,8 @@ sequenceDiagram
     Note over A,C: Session end
     C->>H: sessionEnd (sync)
     H->>H: write records/<session>.json + last-session.md
-    H->>P: refresh prime.txt
+    H->>H: read last 3 session records for knowledge context
+    H->>P: refresh prime.txt (eval + session history + knowledge context)
     H-->>C: done
     H--)H: spawn markdown-eval in background
 
@@ -85,3 +87,50 @@ Prompts used by the hook machinery live in `.github/hooks/prompts/`. They are lo
 | File | Used by |
 |---|---|
 | `promote-learnings.md` | `markdown-eval.mjs` when spawning a promotion via `copilot -p` |
+
+---
+
+## Learning quality features
+
+Three mechanisms improve the signal-to-noise ratio of what gets promoted to durable docs.
+
+### Knowledge type classification
+
+Every session record is automatically classified into one or more knowledge types based on changed files and prompt keywords:
+
+| Type | Triggers |
+|---|---|
+| `architecture` | Backend source file extensions (`.cs`, `.go`, `.java`, `.py`, `.rs`, etc.) or prompts containing: *architect*, *infrastructure*, *provider*, *database*, *backend* |
+| `frontend` | Web UI file extensions (`.tsx`, `.jsx`, `.vue`, `.svelte`, `.css`, `.scss`) |
+| `testing` | Test file conventions (`.spec.`, `.test.`, Playwright, Jest, Vitest, Cypress) |
+| `infrastructure` | IaC/container files (Docker, `.tf`, `.bicep`, YAML) combined with infra-related terms |
+| `workflow` | `docs/`, `AGENTS.md`, `.github/` |
+| `decision` | Prompts containing: *migrat*, *chose*, *decided*, *switch*, *because*, *due to* |
+
+All heuristics use file extensions and prompt keywords — no hardcoded directory paths — so they work in any repo without modification.
+
+Types are stored in `record.metadata.knowledgeTypes[]` and added to the record's `tags`. The `prime.txt` handoff file includes a summary of active knowledge areas from recent sessions for broader context.
+
+### Content classifier
+
+Before a session is promoted, a lightweight classifier checks the quality of its prompts. If ≥75% of captured prompts look like questions or meta-talk (phrases like *"what is"*, *"can you"*, *"let me"*, or ending with `?`), the session's eval score is reduced by 1. This prevents exploratory/conversational sessions from being promoted when they contain no actionable guidance.
+
+The penalty is shown in the eval score breakdown:
+
+```
+Score: 6/11 (groundedness 2, reusability 1, specificity 1, validation 2, semantic 0, classifier penalty -1)
+```
+
+### Jaccard deduplication before synthesis
+
+Before batching review-tier sessions for synthesis, a Jaccard similarity pass removes near-duplicate sessions (threshold: 0.7). When two sessions share >70% of their content tokens, only the higher-scoring one is sent to the synthesis agent. The removed count is logged:
+
+```
+Jaccard dedup: removed 1 near-duplicate review session(s) before synthesis.
+```
+
+This prevents the synthesis agent from seeing the same topic multiple times, which would dilute its output and waste tokens.
+
+### Superseding guidance
+
+When the promote or synthesise agent updates `AGENTS.md` or `docs/`, it is instructed to remove stale guidance rather than append to it. For significant changes, it notes what was superseded inline: *(supersedes: [old guidance summary])*. This keeps durable docs lean and prevents contradictory guidance from accumulating.
